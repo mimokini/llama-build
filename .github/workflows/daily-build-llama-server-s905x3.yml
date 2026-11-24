@@ -1,0 +1,125 @@
+# 每天定时构建（原生 arm64 runner）；也可手动触发
+# 建议放在公开仓库：ubuntu-24.04-arm 在公开仓库是 4 vCPU / 16GB 且免费无限
+# 目标机: Amlogic S905X3 (4x Cortex-A55) / Armbian 26.11 / Debian 13 trixie
+name: Daily Build llama-server for S905X3 (ARM64)
+
+on:
+  schedule:
+    # 03:17 UTC = 北京时间 11:17，避开整点调度高峰
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read        # 纯构建，不推送任何东西
+
+concurrency:
+  group: llama-s905x3-daily
+  cancel-in-progress: true    # 新 run 自动顶掉还在排队的旧 run
+
+env:
+  UPSTREAM_REPO: ggml-org/llama.cpp
+  MARCH: armv8.2-a+dotprod+fp16     # A55 实测有 asimdhp + asimddp
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Resolve upstream master
+        id: up
+        run: |
+          SHA=$(git ls-remote "https://github.com/${UPSTREAM_REPO}.git" refs/heads/master | cut -f1)
+          if [ -z "$SHA" ]; then
+            echo "::error::无法解析上游 master"
+            exit 1
+          fi
+          echo "upstream master = $SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream llama.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.up.outputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ steps.up.outputs.sha }}
+          restore-keys: |
+            ccache-
+
+      - name: Configure
+        working-directory: src
+        env:
+          CCACHE_MAXSIZE: 1G
+          CCACHE_COMPRESS: '1'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-march=${MARCH}" \
+            -DCMAKE_CXX_FLAGS="-march=${MARCH}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -static-libgomp" \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_APP=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=ON \
+            -DGGML_CPU_ARM_ARCH="${MARCH}" \
+            -DGGML_CPU_ALL_VARIANTS=OFF \
+            -DGGML_CPU_REPACK=ON \
+            -DGGML_CPU_KLEIDIAI=ON \
+            -DGGML_LTO=ON \
+            -DGGML_OPENMP=ON \
+            -DGGML_CCACHE=ON
+
+      - name: Build llama-server
+        working-directory: src
+        run: |
+          cmake --build build --target llama-server -j "$(nproc)"
+
+      - name: Smoke test
+        working-directory: src
+        run: |
+          # 这台 runner 本身就是 aarch64，可以直接跑起来验证
+          ./build/bin/llama-server --version | tee /tmp/version.txt
+          file build/bin/llama-server | tee /tmp/arch.txt
+          ls -lh build/bin/llama-server
+
+      - name: Write build info
+        working-directory: src
+        env:
+          SHA: ${{ steps.up.outputs.sha }}
+        run: |
+          {
+            echo "upstream : ${UPSTREAM_REPO}"
+            echo "commit   : ${SHA}"
+            echo "built_at : $(date -u +%FT%TZ)"
+            echo "target   : Amlogic S905X3 / 4x Cortex-A55, ${MARCH}"
+            echo "runner   : $(uname -m) / $(nproc) vCPU"
+            echo "version  : $(head -1 /tmp/version.txt)"
+          } > build/BUILD_INFO.txt
+          cat build/BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-server-s905x3-arm64-${{ steps.up.outputs.short }}
+          retention-days: 14
+          path: |
+            src/build/bin/llama-server
+            src/build/BUILD_INFO.txt

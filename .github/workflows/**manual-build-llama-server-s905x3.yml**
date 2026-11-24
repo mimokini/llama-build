@@ -1,0 +1,156 @@
+# 手动构建（x64 上交叉编译 aarch64）：点 Run workflow 才跑，无定时
+# arm 托管 runner 分配不到、或想指定 tag / 老 commit 复现时用这个
+name: Manual Build llama-server for S905X3 (ARM64, cross)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: '上游 ref（分支名 / tag / commit SHA），留空即 master'
+        required: false
+        default: master
+
+permissions:
+  contents: read          # 只读：不推送仓库，不需要 PAT
+
+concurrency:
+  group: llama-s905x3-manual
+  cancel-in-progress: true    # 连点多次时只保留最后一次
+
+env:
+  UPSTREAM_REPO: ggml-org/llama.cpp
+  # A55 实测 lscpu 有 asimdhp + asimddp
+  MARCH: armv8.2-a+dotprod+fp16
+
+jobs:
+  build:
+    # x64 上交叉编译 aarch64：不会卡在 arm runner 排队
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+
+    steps:
+      - name: Resolve upstream ref
+        id: up
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          REF="${INPUT_REF:-master}"
+          BASE="https://github.com/${UPSTREAM_REPO}.git"
+
+          if [[ "$REF" =~ ^[0-9a-f]{7,40}$ ]]; then
+            # 直接给了 SHA：从 ls-remote 里按前缀反查完整 40 位
+            SHA=$(git ls-remote "$BASE" | awk -v r="$REF" 'index($1, r) == 1 { print $1; exit }')
+          elif [ "$REF" = "master" ]; then
+            SHA=$(git ls-remote "$BASE" refs/heads/master | cut -f1)
+          else
+            SHA=$(git ls-remote "$BASE" "refs/heads/$REF" | cut -f1)
+            if [ -z "$SHA" ]; then
+              SHA=$(git ls-remote "$BASE" "refs/tags/$REF" | cut -f1)
+            fi
+          fi
+
+          if [ -z "$SHA" ]; then
+            echo "::error::找不到 ref '$REF'"
+            exit 1
+          fi
+          echo "ref=$REF -> sha=$SHA"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream llama.cpp
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ steps.up.outputs.sha }}
+          path: src
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build ccache \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-${{ steps.up.outputs.sha }}
+          restore-keys: |
+            ccache-
+
+      - name: Configure
+        working-directory: src
+        env:
+          CCACHE_MAXSIZE: 1G
+          CCACHE_COMPRESS: '1'
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_SYSTEM_NAME=Linux \
+            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
+            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
+            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
+            -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
+            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+            -DCMAKE_C_FLAGS="-march=${MARCH}" \
+            -DCMAKE_CXX_FLAGS="-march=${MARCH}" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++ -static-libgomp" \
+            -DLLAMA_BUILD_SERVER=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_APP=OFF \
+            -DLLAMA_OPENSSL=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU=ON \
+            -DGGML_CPU_ARM_ARCH="${MARCH}" \
+            -DGGML_CPU_ALL_VARIANTS=OFF \
+            -DGGML_CPU_REPACK=ON \
+            -DGGML_CPU_KLEIDIAI=ON \
+            -DGGML_LTO=ON \
+            -DGGML_OPENMP=ON \
+            -DGGML_CCACHE=ON
+
+      - name: Build llama-server
+        working-directory: src
+        run: |
+          cmake --build build --target llama-server -j "$(nproc)"
+
+      - name: Verify artifact is aarch64
+        working-directory: src
+        run: |
+          file build/bin/llama-server | tee /tmp/arch.txt
+          readelf -h build/bin/llama-server | grep -E 'Class|Type|Machine' | tee /tmp/elf.txt
+          if ! readelf -h build/bin/llama-server | grep -q 'Machine:.*AArch64'; then
+            echo "::error::产物不是 aarch64，交叉编译没生效"
+            exit 1
+          fi
+          ls -lh build/bin/llama-server
+
+      - name: Write build info
+        working-directory: src
+        env:
+          SHA: ${{ steps.up.outputs.sha }}
+        run: |
+          {
+            echo "upstream : ${UPSTREAM_REPO}"
+            echo "commit   : ${SHA}"
+            echo "built_at : $(date -u +%FT%TZ)"
+            echo "target   : Amlogic S905X3 / 4x Cortex-A55, ${MARCH}"
+            echo "toolchain: $(aarch64-linux-gnu-gcc -dumpversion)"
+            echo "elf      : $(grep -o 'Machine:.*' /tmp/elf.txt | head -1)"
+          } > build/BUILD_INFO.txt
+          cat build/BUILD_INFO.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llama-server-s905x3-arm64-${{ steps.up.outputs.short }}
+          retention-days: 30
+          path: |
+            src/build/bin/llama-server
+            src/build/BUILD_INFO.txt

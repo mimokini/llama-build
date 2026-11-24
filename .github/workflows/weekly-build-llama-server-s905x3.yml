@@ -45,6 +45,7 @@ jobs:
         env:
           TOKEN: ${{ github.token }}
         run: |
+          echo "::add-mask::${TOKEN}"
           # build-state 分支里的单文件；分支/文件不存在时 curl 返回空，视为"从没构建过"
           LAST=$(curl -sf -H "Authorization: Bearer ${TOKEN}" \
                    -H "Accept: application/vnd.github.raw" \
@@ -56,14 +57,16 @@ jobs:
 
       - name: Decide whether to build
         id: gate
+        env:
+          PREV: ${{ steps.last.outputs.sha }}
         run: |
-          if [ "${{ steps.last.outputs.sha }}" != "${{ steps.up.outputs.sha }}" ] \
-             || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "### 上游有更新：${LAST:-none} → ${{ steps.up.outputs.short }}，开始构建" >> "$GITHUB_STEP_SUMMARY"
-          else
+          if [ -n "$PREV" ] && [ "$PREV" = "${{ steps.up.outputs.sha }}" ] \
+             && [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
             echo "build=false" >> "$GITHUB_OUTPUT"
             echo "### 上游仍是 ${{ steps.up.outputs.short }}，与上次构建相同，本次跳过" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "### 开始构建：${PREV:-<none>} → ${{ steps.up.outputs.short }}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # ---------- 2. 构建 ----------
@@ -75,6 +78,7 @@ jobs:
           ref: ${{ steps.up.outputs.sha }}
           path: src
           fetch-depth: 1
+          persist-credentials: false   # 不在工作区留下 GITHUB_TOKEN
 
       - name: Install dependencies
         if: steps.gate.outputs.build == 'true'
@@ -94,17 +98,19 @@ jobs:
 
       - name: Configure
         if: steps.gate.outputs.build == 'true'
+        timeout-minutes: 20      # KleidiAI 下载 / 编译器探测卡住时快速失败，而不是干等 3 小时
         working-directory: src
         env:
           CCACHE_MAXSIZE: 2G
           CCACHE_COMPRESS: '1'
         run: |
+          # 注意：-static-libgomp 不被 gcc 的 C 驱动识别（CMake 探测编译器时会直接报错），
+          # 所以 libgomp 保持动态链接，板子上要有 libgomp1（Debian 系一般自带）。
+          # 注释必须放在 cmake 命令之前：续行符 \ 中间夹注释会把命令截断。
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_FLAGS="-march=${MARCH}" \
             -DCMAKE_CXX_FLAGS="-march=${MARCH}" \
-            # 注意：-static-libgomp 不被 gcc 的 C 驱动识别（CMake 探测编译器时会直接报错），
-            # 所以 libgomp 保持动态链接，板子上要有 libgomp1（Debian 系一般自带）
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \
@@ -165,6 +171,8 @@ jobs:
             src/build/BUILD_INFO.txt
 
       # ---------- 3. 构建成功后才记录 SHA（避免失败也被当成"已构建"） ----------
+      # 需要 Settings → Actions → General → Workflow permissions 选 "Read and write"，
+      # 否则 GitHub_TOKEN 拿不到写权限，这一步会 403
       - name: Record built commit
         if: steps.gate.outputs.build == 'true'
         env:
@@ -172,6 +180,7 @@ jobs:
           TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          echo "::add-mask::${TOKEN}"
           rm -rf state && mkdir state && cd state
           git init --quiet
           git checkout --quiet --orphan "${STATE_BRANCH}"

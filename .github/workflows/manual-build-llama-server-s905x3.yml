@@ -45,12 +45,17 @@ jobs:
           else
             SHA=$(git ls-remote "$BASE" "refs/heads/$REF" | cut -f1)
             if [ -z "$SHA" ]; then
+              # 带注释的 tag 要用 ^{} 取它指向的 commit，否则拿到的是 tag 对象 SHA，
+              # checkout 时会报 "couldn't find remote ref"
+              SHA=$(git ls-remote "$BASE" "refs/tags/$REF^{}" | cut -f1)
+            fi
+            if [ -z "$SHA" ]; then
               SHA=$(git ls-remote "$BASE" "refs/tags/$REF" | cut -f1)
             fi
           fi
 
           if [ -z "$SHA" ]; then
-            echo "::error::找不到 ref '$REF'"
+            echo "::error::找不到 ref '$REF'（SHA 只支持填某个分支/tag 的 tip commit）"
             exit 1
           fi
           echo "ref=$REF -> sha=$SHA"
@@ -81,11 +86,15 @@ jobs:
             ccache-
 
       - name: Configure
+        timeout-minutes: 30
         working-directory: src
         env:
           CCACHE_MAXSIZE: 1G
           CCACHE_COMPRESS: '1'
         run: |
+          # 注意：-static-libgomp 不被 gcc 的 C 驱动识别（CMake 探测编译器时会直接报错），
+          # 所以 libgomp 保持动态链接，板子上要有 libgomp1（Debian 系一般自带）。
+          # 注释必须放在 cmake 命令之前：续行符 \ 中间夹注释会把命令截断。
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=Linux \
@@ -98,8 +107,6 @@ jobs:
             -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
             -DCMAKE_C_FLAGS="-march=${MARCH}" \
             -DCMAKE_CXX_FLAGS="-march=${MARCH}" \
-            # 注意：-static-libgomp 不被 gcc 的 C 驱动识别（CMake 探测编译器时会直接报错），
-            # 所以 libgomp 保持动态链接，板子上要有 libgomp1（Debian 系一般自带）
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
             -DLLAMA_BUILD_SERVER=ON \
             -DLLAMA_BUILD_TESTS=OFF \

@@ -142,6 +142,15 @@ jobs:
           file build/bin/llama-server | tee /tmp/arch.txt
           ls -lh build/bin/llama-server
 
+      # 先验功能再瘦身：strip 掉符号表，体积通常减一半以上，运行不受影响
+      - name: Strip & checksum
+        if: steps.gate.outputs.build == 'true'
+        working-directory: src
+        run: |
+          strip --strip-unneeded build/bin/llama-server
+          ls -lh build/bin/llama-server
+          ( cd build/bin && sha256sum llama-server > llama-server.sha256 && cat llama-server.sha256 )
+
       - name: Write build info
         if: steps.gate.outputs.build == 'true'
         working-directory: src
@@ -165,10 +174,89 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: llama-server-s905x3-arm64-${{ steps.up.outputs.short }}
-          retention-days: 60
+          retention-days: 14       # Release 里已永久归档，artifact 只留近期方便回看
           path: |
             src/build/bin/llama-server
             src/build/BUILD_INFO.txt
+
+      # ---------- 3. 发 Release：每个 commit 一个 tag，最新那个自动成为 latest ----------
+      # asset 文件名保持固定的 llama-server，这样板子上可以用一个永不变化的 URL：
+      #   https://github.com/<owner>/<repo>/releases/latest/download/llama-server
+      - name: Publish release
+        if: steps.gate.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.up.outputs.sha }}
+          SHORT: ${{ steps.up.outputs.short }}
+          MARCH: ${{ env.MARCH }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          TAG="s905x3-${SHORT}"
+          DATE=$(date -u +%F)
+
+          {
+            echo "**上游**: \`${UPSTREAM_REPO}@${SHA}\`"
+            echo "**构建时间**: ${DATE} (UTC)"
+            echo "**目标**: Amlogic S905X3 / 4x Cortex-A55, \`${MARCH}\`"
+            echo ""
+            echo "**板子上更新（固定地址，不用管版本号）**："
+            echo ""
+            echo "\`\`\`"
+            echo "curl -fL -o llama-server.new \\"
+            echo "  https://github.com/${REPO}/releases/latest/download/llama-server"
+            echo "curl -fsSL https://github.com/${REPO}/releases/latest/download/llama-server.sha256 \\"
+            echo "  | awk '{print \$1\"  llama-server.new\"}' | sha256sum -c -"
+            echo "mv llama-server.new llama-server && chmod +x llama-server"
+            echo "\`\`\`"
+            echo ""
+            echo "产物为静态链接 libgcc/libstdc++，板子上需有 \`libgomp1\`；未开 mlock，内存占用随上下文增长。"
+          } > /tmp/notes.md
+
+          ASSETS="src/build/bin/llama-server src/build/bin/llama-server.sha256 src/build/BUILD_INFO.txt"
+
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # 同一次 commit 被手动重跑：覆盖 asset，不重建 release
+            gh release upload "$TAG" $ASSETS --clobber --repo "$REPO"
+          else
+            gh release create "$TAG" $ASSETS \
+              --repo "$REPO" \
+              --title "llama-server ${SHORT} (S905X3)" \
+              --notes-file /tmp/notes.md
+          fi
+
+          echo "### 已发布 ${TAG}" >> "$GITHUB_STEP_SUMMARY"
+
+      # 只留最近 KEEP 个，多了就把最旧的（连 tag 一起）删掉。
+      # 只清 s905x3- 前缀的，手动建的其它 release 不受影响；
+      # 清理失败也不把这次成功的构建判红。
+      - name: Prune old releases
+        if: steps.gate.outputs.build == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KEEP: 10
+        run: |
+          set -euo pipefail
+          OLD=$(curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
+                  "https://api.github.com/repos/${REPO}/releases?per_page=100" \
+                | jq -r --argjson keep "$KEEP" '
+                    [ .[] | select(.tag_name | startswith("s905x3-")) ]
+                    | sort_by(.created_at) | reverse
+                    | .[$keep:]
+                    | .[] | [.tag_name, .created_at] | @tsv')
+
+          if [ -z "$OLD" ]; then
+            echo "无需清理：s905x3- 前缀的 release 不超过 ${KEEP} 个"
+            exit 0
+          fi
+
+          echo "$OLD" | while IFS=$'\t' read -r tag created; do
+            echo "删除旧 release: ${tag} (${created})"
+            gh release delete "$tag" --yes --cleanup-tag --repo "$REPO"
+          done
+          echo "### 已把 release 收敛到最近 ${KEEP} 个" >> "$GITHUB_STEP_SUMMARY"
 
       # ---------- 3. 构建成功后才记录 SHA（避免失败也被当成"已构建"） ----------
       # 需要 Settings → Actions → General → Workflow permissions 选 "Read and write"，

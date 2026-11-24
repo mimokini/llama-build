@@ -1,6 +1,7 @@
-# 手动构建（x64 上交叉编译 aarch64）：点 Run workflow 才跑，无定时
-# arm 托管 runner 分配不到、或想指定 tag / 老 commit 复现时用这个
-name: Manual Build llama-server for S905X3 (ARM64, cross)
+# 手动构建（arm 原生 runner）：点 Run workflow 才跑，无定时
+# 指定 tag / 老 commit 复现，或不想等周更时用这个
+# 目标机: Amlogic S905X3 (4x Cortex-A55) / Armbian 26.11 / Debian 13 trixie
+name: Manual Build llama-server for S905X3 (ARM64)
 
 on:
   workflow_dispatch:
@@ -24,9 +25,8 @@ env:
 
 jobs:
   build:
-    # x64 上交叉编译 aarch64：不会卡在 arm runner 排队
-    runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    runs-on: ubuntu-24.04-arm      # 公开仓库 4 vCPU / 免费无限
+    timeout-minutes: 180
 
     steps:
       - name: Resolve upstream ref
@@ -69,27 +69,28 @@ jobs:
           ref: ${{ steps.up.outputs.sha }}
           path: src
           fetch-depth: 1
+          persist-credentials: false   # 不在工作区留下 GITHUB_TOKEN
 
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build ccache \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross
+            build-essential cmake ninja-build ccache
 
       - name: Restore ccache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/ccache
           key: ccache-${{ steps.up.outputs.sha }}
           restore-keys: |
             ccache-
 
+      # 原生 aarch64 编译：不需要 CMAKE_SYSTEM_* / FIND_ROOT_PATH / 交叉工具链前缀
       - name: Configure
-        timeout-minutes: 30
+        timeout-minutes: 20      # KleidiAI 下载 / 编译器探测卡住时快速失败
         working-directory: src
         env:
-          CCACHE_MAXSIZE: 1G
+          CCACHE_MAXSIZE: 2G
           CCACHE_COMPRESS: '1'
         run: |
           # 注意：-static-libgomp 不被 gcc 的 C 驱动识别（CMake 探测编译器时会直接报错），
@@ -97,14 +98,6 @@ jobs:
           # 注释必须放在 cmake 命令之前：续行符 \ 中间夹注释会把命令截断。
           cmake -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_SYSTEM_NAME=Linux \
-            -DCMAKE_SYSTEM_PROCESSOR=aarch64 \
-            -DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc \
-            -DCMAKE_CXX_COMPILER=aarch64-linux-gnu-g++ \
-            -DCMAKE_FIND_ROOT_PATH=/usr/aarch64-linux-gnu \
-            -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
-            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
-            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
             -DCMAKE_C_FLAGS="-march=${MARCH}" \
             -DCMAKE_CXX_FLAGS="-march=${MARCH}" \
             -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
@@ -129,13 +122,15 @@ jobs:
         run: |
           cmake --build build --target llama-server -j "$(nproc)"
 
-      - name: Verify artifact is aarch64
+      # runner 本身就是 aarch64，产物可以直接在本机跑起来试
+      - name: Smoke test & verify aarch64
         working-directory: src
         run: |
+          ./build/bin/llama-server --version | tee /tmp/version.txt
           file build/bin/llama-server | tee /tmp/arch.txt
           readelf -h build/bin/llama-server | grep -E 'Class|Type|Machine' | tee /tmp/elf.txt
           if ! readelf -h build/bin/llama-server | grep -q 'Machine:.*AArch64'; then
-            echo "::error::产物不是 aarch64，交叉编译没生效"
+            echo "::error::产物不是 aarch64"
             exit 1
           fi
           ls -lh build/bin/llama-server
@@ -150,7 +145,9 @@ jobs:
             echo "commit   : ${SHA}"
             echo "built_at : $(date -u +%FT%TZ)"
             echo "target   : Amlogic S905X3 / 4x Cortex-A55, ${MARCH}"
-            echo "toolchain: $(aarch64-linux-gnu-gcc -dumpversion)"
+            echo "runner   : $(uname -m) / $(nproc) vCPU"
+            echo "toolchain: $(gcc -dumpversion)"
+            echo "version  : $(head -1 /tmp/version.txt)"
             echo "elf      : $(grep -o 'Machine:.*' /tmp/elf.txt | head -1)"
           } > build/BUILD_INFO.txt
           cat build/BUILD_INFO.txt
@@ -159,7 +156,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: llama-server-s905x3-arm64-${{ steps.up.outputs.short }}
-          retention-days: 30
+          retention-days: 60
           path: |
             src/build/bin/llama-server
             src/build/BUILD_INFO.txt
